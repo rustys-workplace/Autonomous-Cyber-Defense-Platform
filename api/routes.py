@@ -267,6 +267,25 @@ async def run_web_scan(req: WebScanRequest):
         "findings": findings
     }
 
+
+class SQLiScanRequest(BaseModel):
+    url: str
+    enable_time_based: bool = True
+
+
+@router.post("/scanners/sqli")
+async def run_sqli_scan(req: SQLiScanRequest):
+    """On-demand active SQL Injection audit (error-based, boolean-blind, time-based)."""
+    from tools.vuln_scanner_mcp import tool_scan_sqli_live
+    result = await tool_scan_sqli_live(req.url, enable_time_based=req.enable_time_based)
+    return {
+        "url": req.url,
+        "vulnerability_detected": result.get("vulnerability_detected", False),
+        "findings_count": result.get("count", 0),
+        "techniques": result.get("techniques", []),
+        "findings": result.get("findings", []),
+    }
+
 # --- 9. Assessment Report Generation & Export ---
 
 @router.get("/report/json")

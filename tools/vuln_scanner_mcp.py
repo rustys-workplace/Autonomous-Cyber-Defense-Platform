@@ -13,8 +13,11 @@ import sys
 import json
 import re
 import os
+import time
 import asyncio
-from typing import Dict, Any, List, Optional
+import difflib
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from typing import Dict, Any, List, Optional, Tuple
 import httpx
 
 # Logging must go to stderr only, stdout is reserved for JSON-RPC messages
@@ -179,6 +182,279 @@ async def tool_scan_sqli(target: str, param_name: Optional[str] = None) -> Dict[
         "cwe_id": "CWE-89",
         "findings": findings
     }
+
+# ---------------------------------------------------------------------------
+# Active (dynamic) SQL Injection detection engine
+#
+# The original live crawler only performed *error-based* detection (append a
+# single quote, look for a DB error string). That misses the majority of real
+# world SQLi: sites with custom error pages / WAFs, and blind SQLi where the
+# response never contains an error. This engine adds three complementary,
+# strictly non-destructive techniques so a "clearly vulnerable" site is caught:
+#
+#   1. Error-based   - inject a syntax-breaking quote, match a broad library of
+#                      DBMS error signatures (MySQL/Postgres/MSSQL/Oracle/SQLite).
+#   2. Boolean-blind - send a condition that is always TRUE vs always FALSE and
+#                      compare responses; a page that mirrors TRUE==baseline and
+#                      diverges on FALSE is injectable even with no error text.
+#   3. Time-based    - send a benign conditional delay (SLEEP / pg_sleep /
+#                      WAITFOR) and measure the latency increase.
+#
+# Every payload is read-only (SELECT / SLEEP / boolean logic only) and passes
+# the platform SafetyValidator (no DROP/DELETE/UPDATE/INSERT/ALTER/... keywords).
+# ---------------------------------------------------------------------------
+
+# Markers emitted by the validation sandbox when a blind finding is re-confirmed.
+SQLI_BOOLEAN_MARKER = "AGENT_SQLI_BOOLEAN_CONFIRMED"
+SQLI_TIME_MARKER = "AGENT_SQLI_TIME_CONFIRMED"
+
+SQL_ERROR_SIGNATURES = [
+    # MySQL / MariaDB
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "mysql_fetch_array", "mysql_fetch_assoc", "mysql_num_rows", "mysql_query",
+    "supplied argument is not a valid mysql",
+    "check the manual that corresponds to your mysql server version",
+    "mysqli_sql_exception",
+    # PostgreSQL
+    "pg_query", "pg_exec", "postgresql query failed",
+    "unterminated quoted string at or near",
+    "syntax error at or near",
+    "psql:error", "org.postgresql.util.psqlexception",
+    # Microsoft SQL Server / ODBC
+    "unclosed quotation mark after the character string",
+    "incorrect syntax near",
+    "microsoft odbc", "microsoft ole db provider", "odbc sql server driver",
+    "system.data.sqlclient.sqlexception", "mssql_query",
+    # Oracle
+    "ora-00933", "ora-00921", "ora-00936", "ora-01756", "ora-00942",
+    "quoted string not properly terminated", "oracle error",
+    # SQLite
+    "sqlite3.operationalerror", "sqlite_error", "unrecognized token",
+    "sqlite3::query", "near \"'\": syntax error",
+    # Generic
+    "sql syntax", "syntax error near", "sqlstate", "fatal error", "jdbc",
+    "db2 sql error", "sybase message", "query failed",
+]
+
+# Common injectable parameter names, probed when an endpoint exposes none itself.
+_COMMON_PARAMS = ["id", "cat", "page", "item", "pid", "uid", "user", "q",
+                  "search", "category", "name", "product"]
+
+
+def _sql_error_in(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    for sig in SQL_ERROR_SIGNATURES:
+        if sig in low:
+            return sig
+    return None
+
+
+def _similarity(a: str, b: str) -> float:
+    """Fast structural similarity (0..1) between two response bodies."""
+    if a is None or b is None:
+        return 0.0
+    if a == b:
+        return 1.0
+    # Cap length so the ratio stays cheap on large pages.
+    return difflib.SequenceMatcher(None, a[:4000], b[:4000]).quick_ratio()
+
+
+def _set_param(parsed, qs: Dict[str, List[str]], param: str, value: str) -> str:
+    new_qs = {k: v[:] for k, v in qs.items()}
+    new_qs[param] = [value]
+    return urlunparse(parsed._replace(query=urlencode(new_qs, doseq=True)))
+
+
+def _finding(endpoint: str, param: str, method: str, cvss: float,
+             detection_method: str, test_payload: str, expected_marker: str,
+             evidence: str) -> Dict[str, Any]:
+    return {
+        "title": f"SQL Injection in parameter '{param}' (CWE-89)",
+        "severity": "CRITICAL" if cvss >= 9.0 else "HIGH",
+        "cwe_id": "CWE-89",
+        "owasp_category": "A03:2021-Injection",
+        "cvss_score": cvss,
+        "mitre_technique": "T1190",
+        "endpoint": endpoint,
+        "parameter": param,
+        "http_method": method,
+        "detection_method": detection_method,
+        "active_confirmed": True,
+        "confidence": 0.95,
+        "test_payload": test_payload,
+        "expected_marker": expected_marker,
+        "evidence": evidence[:300],
+        "remediation": ("Use parameterized queries / prepared statements and bind "
+                        "every user-supplied value. Never concatenate or interpolate "
+                        "input into SQL. Apply least-privilege DB accounts and a WAF."),
+    }
+
+
+async def _timed_get(client, url: str) -> Tuple[str, int, float]:
+    t0 = time.perf_counter()
+    try:
+        r = await client.get(url)
+        return r.text, r.status_code, time.perf_counter() - t0
+    except Exception:
+        return "", 0, time.perf_counter() - t0
+
+
+async def _probe_param(client, endpoint: str, param: str, orig_val: str,
+                       enable_time_based: bool, time_delay: int) -> Optional[Dict[str, Any]]:
+    """Runs error -> boolean -> time detection against one GET parameter."""
+    parsed = urlparse(endpoint)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    base_val = orig_val if orig_val else "1"
+
+    # Baseline (benign) response.
+    baseline_url = _set_param(parsed, qs, param, base_val)
+    baseline_text, baseline_status, baseline_rt = await _timed_get(client, baseline_url)
+
+    # 1) ERROR-BASED -------------------------------------------------------
+    err_payload = base_val + "'"
+    err_url = _set_param(parsed, qs, param, err_payload)
+    err_text, _, _ = await _timed_get(client, err_url)
+    # Only count errors the benign baseline did NOT already contain.
+    sig = _sql_error_in(err_text)
+    if sig and not (_sql_error_in(baseline_text) == sig):
+        return _finding(endpoint, param, "GET", 9.1, "error-based",
+                        f"{param}={err_payload}", sig,
+                        f"DB error signature '{sig}' surfaced by a single-quote probe.")
+
+    # 2) BOOLEAN-BLIND -----------------------------------------------------
+    # Try string and numeric contexts; require TRUE≈baseline and FALSE divergent.
+    bool_variants = [
+        (f"{base_val}' AND '1'='1", f"{base_val}' AND '1'='2"),
+        (f"{base_val}') AND ('1'='1", f"{base_val}') AND ('1'='2"),
+        (f"{base_val} AND 1=1", f"{base_val} AND 1=2"),
+    ]
+    for true_pl, false_pl in bool_variants:
+        true_text, true_status, _ = await _timed_get(client, _set_param(parsed, qs, param, true_pl))
+        false_text, false_status, _ = await _timed_get(client, _set_param(parsed, qs, param, false_pl))
+        if not true_text and not false_text:
+            continue
+        sim_true = _similarity(baseline_text, true_text)
+        sim_false = _similarity(baseline_text, false_text)
+        sim_tf = _similarity(true_text, false_text)
+        # Injectable: TRUE mirrors the benign page, FALSE clearly diverges.
+        if (true_status == baseline_status and sim_true >= 0.95
+                and sim_false <= 0.90 and sim_tf <= 0.90):
+            return _finding(endpoint, param, "GET", 9.1, "boolean-blind",
+                            f"{param}={true_pl}", SQLI_BOOLEAN_MARKER,
+                            f"TRUE≈baseline (sim={sim_true:.2f}) vs FALSE divergent "
+                            f"(sim={sim_false:.2f}); boolean condition controls the response.")
+
+    # 3) TIME-BASED --------------------------------------------------------
+    if enable_time_based:
+        # Re-measure a quick baseline to avoid one-off network jitter.
+        _, _, rt1 = await _timed_get(client, baseline_url)
+        clean_rt = min(baseline_rt, rt1)
+        time_payloads = [
+            f"{base_val}' AND SLEEP({time_delay})-- -",       # MySQL string
+            f"{base_val} AND SLEEP({time_delay})",            # MySQL numeric
+            f"{base_val}'||pg_sleep({time_delay})-- -",       # PostgreSQL
+            f"{base_val}'; WAITFOR DELAY '0:0:{time_delay}'-- -",  # MSSQL
+        ]
+        for pl in time_payloads:
+            _, _, rt = await _timed_get(client, _set_param(parsed, qs, param, pl))
+            if rt >= clean_rt + (time_delay * 0.8) and rt >= time_delay * 0.8:
+                return _finding(endpoint, param, "GET", 9.1, "time-based",
+                                f"{param}={pl}", SQLI_TIME_MARKER,
+                                f"Benign conditional delay increased response time to "
+                                f"{rt:.1f}s (baseline {clean_rt:.2f}s).")
+    return None
+
+
+async def active_sqli_scan(base_url: str, endpoints: Optional[List[str]] = None,
+                           forms: Optional[List[Dict[str, Any]]] = None,
+                           client: Optional[httpx.AsyncClient] = None,
+                           enable_time_based: bool = True, time_delay: int = 3,
+                           max_points: int = 20) -> List[Dict[str, Any]]:
+    """
+    Actively probes a live target for SQL Injection using error-based,
+    boolean-blind and time-based techniques. Returns a list of finding dicts
+    (one per confirmed injectable parameter), de-duplicated by (endpoint, param).
+
+    `client` may be injected for testing; otherwise a short-timeout client is
+    created. Time-based needs a larger read timeout than the others.
+    """
+    if not base_url.startswith("http://") and not base_url.startswith("https://"):
+        base_url = f"http://{base_url}"
+
+    # Build the candidate injection points (endpoint, param, original value).
+    points: List[Tuple[str, str, str]] = []
+    seen = set()
+
+    def add_point(endpoint: str, param: str, val: str):
+        key = (endpoint.split("?")[0], param)
+        if key not in seen:
+            seen.add(key)
+            points.append((endpoint, param, val))
+
+    for ep in (endpoints or [base_url]):
+        q = urlparse(ep).query
+        if q:
+            for param, vals in parse_qs(q, keep_blank_values=True).items():
+                add_point(ep, param, vals[0] if vals else "1")
+
+    # If a dynamic-looking endpoint exposes no parameters, try common ones.
+    for ep in (endpoints or [base_url]):
+        base_ep = ep.split("?")[0]
+        looks_dynamic = (not urlparse(ep).query and
+                         (re.search(r"\.(php|asp|aspx|jsp|cgi|do)$", base_ep, re.I)
+                          or "/api/" in base_ep or base_ep.rstrip("/").count("/") >= 3
+                          or base_ep == base_url))
+        if looks_dynamic:
+            for cp in _COMMON_PARAMS[:6]:
+                add_point(f"{base_ep}?{cp}=1", cp, "1")
+
+    points = points[:max_points]
+    if not points:
+        return []
+
+    owns_client = client is None
+    if owns_client:
+        # Timeout must exceed the time-based delay so a real SLEEP is observable.
+        read_to = max(5.0, time_delay + 4.0) if enable_time_based else 5.0
+        client = httpx.AsyncClient(verify=False, follow_redirects=True,
+                                   timeout=httpx.Timeout(read_to, connect=5.0))
+    findings: List[Dict[str, Any]] = []
+    try:
+        # Error + boolean are cheap -> run concurrently. Time-based (serial
+        # delays) is only reached inside _probe_param when the first two miss.
+        sem = asyncio.Semaphore(8)
+
+        async def guarded(ep, param, val):
+            async with sem:
+                return await _probe_param(client, ep, param, val,
+                                          enable_time_based, time_delay)
+
+        results = await asyncio.gather(
+            *[guarded(ep, p, v) for (ep, p, v) in points], return_exceptions=True)
+        for res in results:
+            if isinstance(res, dict):
+                findings.append(res)
+    finally:
+        if owns_client:
+            await client.aclose()
+    return findings
+
+
+async def tool_scan_sqli_live(target: str, enable_time_based: bool = True) -> Dict[str, Any]:
+    """MCP tool: active (dynamic) SQL injection audit against a live URL."""
+    try:
+        findings = await active_sqli_scan(target, enable_time_based=enable_time_based)
+    except Exception as e:
+        return {"vulnerability_detected": False, "error": str(e), "cwe_id": "CWE-89", "findings": []}
+    return {
+        "vulnerability_detected": len(findings) > 0,
+        "count": len(findings),
+        "cwe_id": "CWE-89",
+        "techniques": ["error-based", "boolean-blind", "time-based"],
+        "findings": findings,
+    }
+
 
 async def tool_scan_xss(target: str) -> Dict[str, Any]:
     """Scans code or URL for Cross-Site Scripting (XSS) weaknesses."""
@@ -1038,6 +1314,24 @@ TOOLS_METADATA = [
         }
     },
     {
+        "name": "scan_sqli_live",
+        "description": "Actively audits a LIVE URL for SQL Injection (CWE-89) using error-based, boolean-blind, and time-based techniques with strictly non-destructive read-only payloads. Detects blind SQLi that error-only scanners miss.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Live URL (optionally with query parameters) to actively probe for SQL Injection."
+                },
+                "enable_time_based": {
+                    "type": "boolean",
+                    "description": "Whether to run time-based blind probes (adds latency). Default true."
+                }
+            },
+            "required": ["target"]
+        }
+    },
+    {
         "name": "scan_xss",
         "description": "Scans code, templates, or URLs for Cross-Site Scripting (XSS) vulnerabilities (CWE-79), identifying unescaped innerHTML sinks, unescaped template tags, and script reflection.",
         "inputSchema": {
@@ -1192,6 +1486,8 @@ TOOLS_METADATA = [
 async def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Any:
     if name == "scan_sqli":
         return await tool_scan_sqli(arguments.get("target", ""), arguments.get("param_name"))
+    elif name == "scan_sqli_live":
+        return await tool_scan_sqli_live(arguments.get("target", ""), arguments.get("enable_time_based", True))
     elif name == "scan_xss":
         return await tool_scan_xss(arguments.get("target", ""))
     elif name == "scan_code_sast":

@@ -162,6 +162,7 @@ async def query_nvd(cpe_string: str, api_key: str = None) -> List[Dict]:
 
 from tools.vuln_scanner_mcp import (
     tool_scan_sqli,
+    tool_scan_sqli_live,
     tool_scan_xss,
     tool_scan_code_sast,
     tool_scan_web_vulnerabilities,
@@ -170,8 +171,23 @@ from tools.vuln_scanner_mcp import (
     tool_dlr_bruteforce,
     tool_api_endpoint_scanner,
     tool_mitre_mapper,
-    tool_scan_owasp_top10
+    tool_scan_owasp_top10,
+    active_sqli_scan,
 )
+
+
+async def sqli_scanner(target: str, endpoints: list = None, enable_time_based: bool = True) -> Dict:
+    """
+    Dedicated active SQL Injection auditor (error-based, boolean-blind, time-based).
+    Returns {"vulnerabilities": [...]} so the VAPT agent can queue each finding.
+    """
+    logger.info(f"[SQLiScanner] Active SQL injection audit on {target}...")
+    try:
+        findings = await active_sqli_scan(target, endpoints=endpoints, enable_time_based=enable_time_based)
+    except Exception as e:
+        logger.warning(f"[SQLiScanner] probe failed: {e}")
+        findings = []
+    return {"target": target, "vulnerabilities": findings}
 
 async def scan_web_vulnerabilities(target: str) -> List[Dict]:
     """
@@ -415,45 +431,8 @@ async def web_crawler(target_url: str, max_depth: int = 2, max_pages: int = 8) -
                     continue
                 tested_params.add(param)
 
-                # Test 1: SQL Injection Error-Based Probe
-                sqli_probe = "'"
-                sqli_query = dict(qs)
-                sqli_query[param] = [vals[0] + sqli_probe if vals else sqli_probe]
-                test_sqli_url = urlunparse(parsed_p._replace(query=urlencode(sqli_query, doseq=True)))
-
-                try:
-                    sqli_resp = await client.get(test_sqli_url)
-                    s_body = sqli_resp.text.lower()
-                    sql_errors = [
-                        "you have an error in your sql syntax",
-                        "syntax error near",
-                        "unclosed quotation mark",
-                        "mysql_fetch",
-                        "mysql_query",
-                        "pg_query",
-                        "sqlite3.operationalerror",
-                        "ora-01756",
-                        "ora-00933",
-                        "postgresql query failed"
-                    ]
-                    for err in sql_errors:
-                        if err in s_body:
-                            vulnerabilities.append({
-                                "title": f"SQL Injection in parameter '{param}' (CWE-89)",
-                                "severity": "HIGH",
-                                "cwe_id": "CWE-89",
-                                "owasp_category": "A03:2021-Injection",
-                                "cvss_score": 8.9,
-                                "mitre_technique": "T1190",
-                                "endpoint": p_url,
-                                "parameter": param,
-                                "test_payload": "' OR '1'='1' --",
-                                "expected_marker": err,
-                                "remediation": "Use parameterized SQL statements (prepared statements) to prevent untrusted input interpretation."
-                            })
-                            break
-                except Exception:
-                    pass
+                # SQL Injection (error/boolean/time) is handled by the dedicated
+                # active_sqli_scan engine over all discovered endpoints below.
 
                 # Test 2: Reflected XSS Canary Probe
                 xss_canary = "<script>/*canary*/alert(1)</script>"
@@ -479,6 +458,21 @@ async def web_crawler(target_url: str, max_depth: int = 2, max_pages: int = 8) -
                         })
                 except Exception:
                     pass
+
+        # Deep active SQL injection audit (error-based + boolean-blind +
+        # time-based) across every discovered endpoint. This replaces the old
+        # error-only probe so blind SQLi on live targets is no longer missed.
+        try:
+            sqli_findings = await active_sqli_scan(
+                base_url, endpoints=discovered_endpoints or [base_url], enable_time_based=True
+            )
+            existing = {(v.get("endpoint"), v.get("parameter"))
+                        for v in vulnerabilities if v.get("cwe_id") == "CWE-89"}
+            for f in sqli_findings:
+                if (f.get("endpoint"), f.get("parameter")) not in existing:
+                    vulnerabilities.append(f)
+        except Exception as e:
+            logger.warning(f"[WebCrawler] active SQLi scan failed: {e}")
 
     return {
         "target_url": base_url,

@@ -63,7 +63,8 @@ flowchart TD
 ## Key Features
 
 - **Model Context Protocol (MCP) Integration**: Features a native stdio MCP server (`tools/vuln_scanner_mcp.py`) supporting:
-  - Deep SQL Injection auditing (`scan_sqli` - CWE-89)
+  - Deep SQL Injection auditing (`scan_sqli` - CWE-89, static/code & signature analysis)
+  - Active live SQL Injection detection (`scan_sqli_live` - CWE-89) using **error-based, boolean-blind, and time-based** techniques with strictly non-destructive, read-only payloads — catches blind SQLi that error-only scanners miss
   - Cross-Site Scripting detection (`scan_xss` - CWE-79)
   - Static Application Security Testing (`scan_code_sast` - OWASP Top 10)
   - Live/Simulated web security header and CORS checks (`scan_web_vulnerabilities`)
@@ -226,6 +227,7 @@ pytest tests/ -v
 | `GET` | `/api/v1/session` | Get current scan session telemetry and timer state |
 | `POST` | `/api/v1/scanners/sast` | On-demand Static Application Security Testing (OWASP Top 10) |
 | `POST` | `/api/v1/scanners/web` | On-demand live/simulated web application auditing |
+| `POST` | `/api/v1/scanners/sqli` | On-demand active SQL Injection audit (error-based, boolean-blind, time-based) |
 
 ---
 
