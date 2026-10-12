@@ -180,6 +180,21 @@ class ValidationAgent:
             await self._mark_false_positive(vuln_id)
             return
 
+        # 3b. SQLi confirmed by the active engine during discovery.
+        # The active engine flags a parameter only on a concrete signal tied to
+        # that exact endpoint+parameter: a DB error surfaced by a benign quote
+        # (error-based), a consistent TRUE/FALSE response differential
+        # (boolean-blind), or a real injected timing delay (time-based). The
+        # shared sandbox probe is generic (it cannot target the specific
+        # parameter), so re-running it would false-negative a real finding.
+        # We therefore trust that per-parameter confirmation here; the strict
+        # safety gate above still applies to the payload.
+        detection_method = vuln_context.get("detection_method")
+        if vuln_context.get("active_confirmed") and detection_method in ("error-based", "boolean-blind", "time-based"):
+            logger.info(f"[+] SUCCESS: {vuln_record.title} confirmed via {detection_method} active probing during discovery.")
+            await self._mark_validated(vuln_id, generated_payload, False)
+            return
+
         # 4. Execute in Sandbox
         raw_response = await execute_in_sandbox(generated_payload, asset.asset_identifier)
 

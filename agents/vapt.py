@@ -11,6 +11,7 @@ from tools.scanners import (
     ssl_checker,
     dir_bruteforce,
     api_endpoint_scanner,
+    sqli_scanner,
     query_nvd,
     scan_web_vulnerabilities,
     scan_phishing,
@@ -73,6 +74,7 @@ class VAPTAgent:
             web_tasks.append(asyncio.create_task(dir_bruteforce(target)))
             web_tasks.append(asyncio.create_task(api_endpoint_scanner(target)))
             web_tasks.append(asyncio.create_task(scan_phishing(target)))
+            web_tasks.append(asyncio.create_task(sqli_scanner(target)))
 
         # Wait for network scan
         nmap_output = await network_task
@@ -94,6 +96,7 @@ class VAPTAgent:
             dir_res = results[4] if len(results) > 4 and not isinstance(results[4], Exception) else {}
             api_res = results[5] if len(results) > 5 and not isinstance(results[5], Exception) else {}
             phish_res = results[6] if len(results) > 6 and not isinstance(results[6], Exception) else {}
+            sqli_res = results[7] if len(results) > 7 and not isinstance(results[7], Exception) else {}
 
             # Process crawler findings (SQLi, XSS, etc.)
             if isinstance(crawler_res, dict):
@@ -130,6 +133,11 @@ class VAPTAgent:
                 for p_vuln in phish_res.get("vulnerabilities", []):
                     p_vuln["phishing_score"] = phish_res.get("phishing_score", 45)
                     await self._queue_web_validation_task(asset.id, p_vuln, source="TOOL_PHISHING_DETECTOR", layer="Email/OSINT")
+
+            # Process dedicated active SQLi engine findings (error/boolean/time-based)
+            if isinstance(sqli_res, dict):
+                for q_vuln in sqli_res.get("vulnerabilities", []):
+                    await self._queue_web_validation_task(asset.id, q_vuln, source="TOOL_SQLI_ACTIVE")
 
         logger.info(f"VAPT scan complete for {target}.")
 
@@ -197,11 +205,15 @@ class VAPTAgent:
             "mitre": mitre_data,
             "path": vuln.get("path"),
             "endpoint": vuln.get("endpoint"),
+            "parameter": vuln.get("parameter"),
             "phishing_score": vuln.get("phishing_score"),
             "test_payload": vuln.get("test_payload"),
             "expected_marker": vuln.get("expected_marker"),
             "owasp_category": vuln.get("owasp_category"),
-            "remediation": vuln.get("remediation")
+            "remediation": vuln.get("remediation"),
+            "detection_method": vuln.get("detection_method"),
+            "active_confirmed": vuln.get("active_confirmed", False),
+            "evidence": vuln.get("evidence"),
         }
         
         vuln_record = VulnerabilityRecord(
