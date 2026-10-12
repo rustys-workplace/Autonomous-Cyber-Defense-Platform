@@ -46,6 +46,10 @@ class DatabaseClient:
     """
     def __init__(self, database_url: Optional[str] = None):
         self._lock = asyncio.Lock()
+        # Signalled whenever a pending task is inserted so the Orchestrator can
+        # dispatch immediately instead of polling on a timer (minimizes the
+        # discovery -> validation -> remediation latency).
+        self._task_available = asyncio.Event()
         self.database_url = database_url or os.getenv("DATABASE_URL")
         self.pg_pool = None
         self.use_postgres = False
@@ -315,6 +319,9 @@ class DatabaseClient:
     async def insert_task(self, task: TaskItem) -> str:
         async with self._lock:
             self.tasks[task.id] = task
+            # Wake the Orchestrator immediately if this task is dispatchable.
+            if task.status == "pending":
+                self._task_available.set()
 
         if self.use_postgres and self.pg_pool:
             try:
@@ -346,6 +353,27 @@ class DatabaseClient:
                 return None
             pending_tasks.sort(key=lambda x: x.priority, reverse=True)
             return pending_tasks[0]
+
+    async def wait_for_task(self, timeout: Optional[float] = None):
+        """Blocks until a pending task is (or already is) available.
+
+        Race-safe: clears the signal, re-checks for any pending task that may
+        have been inserted between the caller's last fetch and this clear, and
+        only then waits. The timeout is a self-healing safety net so a missed
+        wakeup can never stall the pipeline permanently.
+        """
+        async with self._lock:
+            has_pending = any(t.status == "pending" for t in self.tasks.values())
+            if has_pending:
+                self._task_available.set()
+                return True
+            self._task_available.clear()
+
+        try:
+            await asyncio.wait_for(self._task_available.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def mark_task_in_progress(self, task_id: str):
         async with self._lock:

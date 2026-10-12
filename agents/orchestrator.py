@@ -13,16 +13,35 @@ from core.config import settings
 
 logger = logging.getLogger("Orchestrator")
 
+
+class UnifiedMockLLM(MockLLMClient, MockValidationLLM, MockAttackPathLLM, MockRemediationLLM):
+    """
+    Deterministic offline LLM used when no real LLM API key is configured.
+
+    It composes every per-agent mock so that a SINGLE client exposes the full
+    capability surface the real LLM client provides:
+      - extract_cpe_from_nmap   (VAPT Agent)
+      - generate_safe_poc       (Validation Agent)
+      - evaluate_chainability / evaluate_vuln_transition (Attack-Path Agent)
+      - generate_patch          (Remediation Agent)
+
+    Without this, the fallback client only implemented extract_cpe_from_nmap,
+    which crashed the Validation and Remediation agents on every task whenever
+    the platform ran in its default no-API-key mode.
+    """
+    pass
+
+
 class Orchestrator:
     def __init__(self, db_client):
         self.db = db_client
         # Map agent enums to their respective async handlers.
-        # As we build the real agents in the next steps, we will replace 
-        # these mock functions with actual Agent class initializations.
         if settings.has_llm:
             self.llm_client = RealLLMClient(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL, model=settings.LLM_MODEL)
         else:
-            self.llm_client = MockLLMClient()
+            # No API key: use the fully-featured deterministic client so every
+            # agent (not just VAPT) works offline / in CI / in demos.
+            self.llm_client = UnifiedMockLLM()
             
         self.vapt_agent = VAPTAgent(db_client=db_client, llm_client=self.llm_client, nvd_api_key=settings.NVD_API_KEY)
         self.validation_agent = ValidationAgent(db_client, self.llm_client)
@@ -43,37 +62,50 @@ class Orchestrator:
             AgentType.RETEST: self.retest_agent.execute_task,
         }
 
+    # Safety-net timeout for the event wait. The loop is driven by the DB's
+    # task-available signal; this only bounds how long it blocks if a wakeup
+    # is ever missed, so the system is self-healing without busy-polling.
+    IDLE_WAKE_TIMEOUT = 2.0
+
     async def run_main_loop(self):
-        """The continuous central loop of the AI system."""
+        """The continuous central loop of the AI system.
+
+        Event-driven: the loop dispatches every currently-pending task back to
+        back with no artificial delay, then sleeps on the DB's task-available
+        event until new work is queued. This minimizes the time between a
+        vulnerability being discovered and it being validated/remediated —
+        previously each dispatch paid a fixed 0.5s cosmetic delay and each idle
+        wave paid a 2s poll, which dominated end-to-end latency.
+        """
         logger.info("Starting Orchestrator Main Loop...")
         try:
             while True:
                 # 1. Fetch the highest priority pending task
                 task = await self.db.get_highest_priority_task()
-                
+
                 if not task:
-                    # Queue is empty, sleep briefly before polling again
-                    await asyncio.sleep(2)
+                    # No work pending. Arm the event and re-check to close the
+                    # race where a task is inserted between fetch and clear,
+                    # then wait to be woken by insert_task (bounded as a safety net).
+                    await self.db.wait_for_task(timeout=self.IDLE_WAKE_TIMEOUT)
                     continue
 
                 logger.info(f"Picked up [Priority {task.priority}] Task for {task.target_agent.value} (Task ID: {task.id[:8]})")
-                
+
                 # 2. Mark as in-progress to prevent other loop iterations from grabbing it
                 await self.db.mark_task_in_progress(task.id)
 
                 # 3. Route to the correct agent
                 handler = self.agent_routers.get(task.target_agent)
-                
+
                 if handler:
-                    # Spawn the agent non-blockingly using asyncio.create_task.
-                    # This allows the Orchestrator to instantly fetch the next task in the queue.
+                    # Spawn the agent non-blockingly so the Orchestrator can
+                    # immediately dispatch the next pending task concurrently.
                     asyncio.create_task(self._execute_agent(handler, task))
                 else:
                     logger.error(f"Unknown agent type requested: {task.target_agent}")
                     await self.db.complete_task(task.id, status="failed")
-                    
-                await asyncio.sleep(0.5) # Slight delay to keep terminal output readable in this demo
-                
+
         except asyncio.CancelledError:
             logger.info("Orchestrator shutting down cleanly...")
 
@@ -86,30 +118,3 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Agent failed on task {task.id[:8]}: {str(e)}")
             await self.db.complete_task(task.id, status="failed")
-
-    # --- Mock Agent Handlers ---
-    # These simulate the time it takes for agents to do their jobs.
-    
-    async def _mock_vapt_agent(self, payload: Dict[str, Any]):
-        logger.info(f"-> [VAPT Agent] Running discovery on asset: {payload.get('asset_id')}")
-        await asyncio.sleep(2) # Simulating nmap / recon
-
-    async def _mock_validation_agent(self, payload: Dict[str, Any]):
-        logger.info(f"-> [Validation Agent] Generating PoC for vuln: {payload.get('vulnerability_id')}")
-        await asyncio.sleep(1.5)
-
-    async def _mock_attack_path_agent(self, payload: Dict[str, Any]):
-        logger.info(f"-> [Attack-Path Agent] Recalculating graph...")
-        await asyncio.sleep(0.5)
-
-    async def _mock_threat_intel_agent(self, payload: Dict[str, Any]):
-        logger.info(f"-> [Threat Intel Agent] Checking HIBP/VirusTotal for asset: {payload.get('asset_id')}")
-        await asyncio.sleep(1)
-
-    async def _mock_remediation_agent(self, payload: Dict[str, Any]):
-        logger.info(f"-> [Remediation Agent] Writing code patch for vuln: {payload.get('vulnerability_id')}")
-        await asyncio.sleep(2)
-
-    async def _mock_retest_agent(self, payload: Dict[str, Any]):
-        logger.info(f"-> [Retest Agent] Verifying staging environment patch...")
-        await asyncio.sleep(1)
